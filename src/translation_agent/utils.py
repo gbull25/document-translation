@@ -6,21 +6,106 @@ import tiktoken
 from dotenv import load_dotenv
 from icecream import ic
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+import os
+import time
+from functools import wraps
+from threading import Lock
+from typing import Optional, Union
+
+import gradio as gr
+import openai
+import translation_agent.utils as utils
 
 
-load_dotenv()  # read local .env file
-client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+RPM = 60
+MODEL = "gemma3:12b"
+TEMPERATURE = 0.3
+# Hide js_mode in UI now, update in plan.
+JS_MODE = False
+ENDPOINT = ""
 
 MAX_TOKENS_PER_CHUNK = (
     1000  # if text is more than this many tokens, we'll break it up into
 )
 # discrete chunks to translate one chunk at a time
+client = openai.OpenAI(
+                api_key="ollama", base_url="http://localhost:11434/v1"
+            )
+
+# Add your LLMs here
+def model_load(
+    endpoint: str,
+    base_url: str,
+    model: str,
+    api_key: Optional[str] = None,
+    temperature: float = TEMPERATURE,
+    rpm: int = RPM,
+    js_mode: bool = JS_MODE,
+):
+    global client, RPM, MODEL, TEMPERATURE, JS_MODE, ENDPOINT
+    ENDPOINT = endpoint
+    RPM = rpm
+    MODEL = model
+    TEMPERATURE = temperature
+    JS_MODE = js_mode
+    client = openai.OpenAI(
+                api_key="ollama", base_url="http://localhost:11434/v1"
+            )
+    match endpoint:
+        case "OpenAI":
+            client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        case "Groq":
+            client = openai.OpenAI(
+                api_key=api_key if api_key else os.getenv("GROQ_API_KEY"),
+                base_url="https://api.groq.com/openai/v1",
+            )
+        case "TogetherAI":
+            client = openai.OpenAI(
+                api_key=api_key if api_key else os.getenv("TOGETHER_API_KEY"),
+                base_url="https://api.together.xyz/v1",
+            )
+        case "CUSTOM":
+            client = openai.OpenAI(api_key=api_key, base_url=base_url)
+        case "Ollama":
+            client = openai.OpenAI(
+                api_key="ollama", base_url="http://localhost:11434/v1"
+            )
+        case _:
+            client = openai.OpenAI(
+                api_key=api_key if api_key else os.getenv("OPENAI_API_KEY")
+            )
 
 
+def rate_limit(get_max_per_minute):
+    def decorator(func):
+        lock = Lock()
+        last_called = [0.0]
+
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            with lock:
+                max_per_minute = get_max_per_minute()
+                min_interval = 60.0 / max_per_minute
+                elapsed = time.time() - last_called[0]
+                left_to_wait = min_interval - elapsed
+
+                if left_to_wait > 0:
+                    time.sleep(left_to_wait)
+
+                ret = func(*args, **kwargs)
+                last_called[0] = time.time()
+                return ret
+
+        return wrapper
+
+    return decorator
+
+
+@rate_limit(lambda: RPM)
 def get_completion(
     prompt: str,
     system_message: str = "You are a helpful assistant.",
-    model: str = "gpt-4-turbo",
+    model: str = "gemma3:12b",
     temperature: float = 0.3,
     json_mode: bool = False,
 ) -> Union[str, dict]:
@@ -44,29 +129,39 @@ def get_completion(
             If json_mode is False, returns the generated text as a string.
     """
 
+    model = MODEL
+    temperature = TEMPERATURE
+    json_mode = JS_MODE
+
     if json_mode:
-        response = client.chat.completions.create(
-            model=model,
-            temperature=temperature,
-            top_p=1,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": prompt},
-            ],
-        )
-        return response.choices[0].message.content
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                temperature=temperature,
+                top_p=1,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": system_message},
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            raise gr.Error(f"An unexpected error occurred: {e}") from e
     else:
-        response = client.chat.completions.create(
-            model=model,
-            temperature=temperature,
-            top_p=1,
-            messages=[
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": prompt},
-            ],
-        )
-        return response.choices[0].message.content
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                temperature=temperature,
+                top_p=1,
+                messages=[
+                    {"role": "system", "content": system_message},
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            raise gr.Error(f"An unexpected error occurred: {e}") from e
 
 
 def one_chunk_initial_translation(
@@ -229,7 +324,7 @@ Output only the new translation and nothing else."""
 
 
 def one_chunk_translate_text(
-    source_lang: str, target_lang: str, source_text: str, country: str = ""
+    source_lang: str, target_lang: str, source_text: str, do_reflection: bool, country: str = ""
 ) -> str:
     """
     Translate a single chunk of text from the source language to the target language.
@@ -249,15 +344,20 @@ def one_chunk_translate_text(
     translation_1 = one_chunk_initial_translation(
         source_lang, target_lang, source_text
     )
+    
+    if do_reflection:
 
-    reflection = one_chunk_reflect_on_translation(
-        source_lang, target_lang, source_text, translation_1, country
-    )
-    translation_2 = one_chunk_improve_translation(
-        source_lang, target_lang, source_text, translation_1, reflection
-    )
+        reflection = one_chunk_reflect_on_translation(
+            source_lang, target_lang, source_text, translation_1, country
+        )
+        translation_2 = one_chunk_improve_translation(
+            source_lang, target_lang, source_text, translation_1, reflection
+        )
 
-    return translation_2
+        return translation_2
+    
+    else:
+        return translation_1
 
 
 def num_tokens_in_string(
@@ -305,17 +405,17 @@ def multichunk_initial_translation(
     translation_prompt = """Your task is to provide a professional translation from {source_lang} to {target_lang} of PART of a text.
 
 The source text is below, delimited by XML tags <SOURCE_TEXT> and </SOURCE_TEXT>. Translate only the part within the source text
-delimited by <TRANSLATE_THIS> and </TRANSLATE_THIS>. You can use the rest of the source text as context, but do not translate any
+delimited by <TRANSLATE_THIS_TO_RUSSIAN> and </TRANSLATE_THIS_TO_RUSSIAN>. You can use the rest of the source text as context, but do not translate any
 of the other text. Do not output anything other than the translation of the indicated part of the text.
 
 <SOURCE_TEXT>
 {tagged_text}
 </SOURCE_TEXT>
 
-To reiterate, you should translate only this part of the text, shown here again between <TRANSLATE_THIS> and </TRANSLATE_THIS>:
-<TRANSLATE_THIS>
+To reiterate, you should translate only this part of the text, shown here again between <TRANSLATE_THIS_TO_RUSSIAN> and </TRANSLATE_THIS_TO_RUSSIAN>:
+<TRANSLATE_THIS_TO_RUSSIAN>
 {chunk_to_translate}
-</TRANSLATE_THIS>
+</TRANSLATE_THIS_TO_RUSSIAN>
 
 Output only the translation of the portion you are asked to translate, and nothing else.
 """
@@ -330,7 +430,7 @@ Output only the translation of the portion you are asked to translate, and nothi
             + "</TRANSLATE_THIS>"
             + "".join(source_text_chunks[i + 1 :])
         )
-
+        
         prompt = translation_prompt.format(
             source_lang=source_lang,
             target_lang=target_lang,
@@ -552,7 +652,7 @@ Output only the new translation of the indicated part and nothing else."""
 
 
 def multichunk_translation(
-    source_lang, target_lang, source_text_chunks, country: str = ""
+    source_lang, target_lang, source_text_chunks, do_reflection, country: str = "",
 ):
     """
     Improves the translation of multiple text chunks based on the initial translation and reflection.
@@ -572,23 +672,28 @@ def multichunk_translation(
         source_lang, target_lang, source_text_chunks
     )
 
-    reflection_chunks = multichunk_reflect_on_translation(
-        source_lang,
-        target_lang,
-        source_text_chunks,
-        translation_1_chunks,
-        country,
-    )
+    if do_reflection:
 
-    translation_2_chunks = multichunk_improve_translation(
-        source_lang,
-        target_lang,
-        source_text_chunks,
-        translation_1_chunks,
-        reflection_chunks,
-    )
+        reflection_chunks = multichunk_reflect_on_translation(
+            source_lang,
+            target_lang,
+            source_text_chunks,
+            translation_1_chunks,
+            country,
+        )
 
-    return translation_2_chunks
+        translation_2_chunks = multichunk_improve_translation(
+            source_lang,
+            target_lang,
+            source_text_chunks,
+            translation_1_chunks,
+            reflection_chunks,
+        )
+
+        return translation_2_chunks
+    
+    else:
+        return translation_1_chunks
 
 
 def calculate_chunk_size(token_count: int, token_limit: int) -> int:
@@ -638,6 +743,7 @@ def translate(
     source_text,
     country,
     max_tokens=MAX_TOKENS_PER_CHUNK,
+    do_reflection = True
 ):
     """Translate the source_text from source_lang to target_lang."""
 
@@ -649,7 +755,7 @@ def translate(
         ic("Translating text as a single chunk")
 
         final_translation = one_chunk_translate_text(
-            source_lang, target_lang, source_text, country
+            source_lang, target_lang, source_text, do_reflection, country,
         )
 
         return final_translation
@@ -672,7 +778,7 @@ def translate(
         source_text_chunks = text_splitter.split_text(source_text)
 
         translation_2_chunks = multichunk_translation(
-            source_lang, target_lang, source_text_chunks, country
+            source_lang, target_lang, source_text_chunks, do_reflection, country
         )
 
         return "".join(translation_2_chunks)
